@@ -499,6 +499,7 @@ Inspired from: [User-defined operators with vector outputs](https://jump.dev/JuM
 function get_optim_functions(mpc::NonLinMPC, ::JuMP.GenericModel{JNT}) where JNT<:Real
     model = mpc.estim.model
     nu, ny, nx̂, nϵ, Hp = model.nu, model.ny, mpc.estim.nx̂, mpc.nϵ, mpc.Hp
+    ne = 0
     ng, nc, nΔŨ, nU, nŶ = length(mpc.con.i_g), mpc.con.nc, length(mpc.ΔŨ), Hp*nu, Hp*ny
     nUe, nŶe = nU + nu, nŶ + ny
     Ncache = nΔŨ + 3
@@ -512,6 +513,7 @@ function get_optim_functions(mpc::NonLinMPC, ::JuMP.GenericModel{JNT}) where JNT
     u0_cache::DiffCache{Vector{JNT}, Vector{JNT}}     = DiffCache(zeros(JNT, nu),  Ncache)
     û0_cache::DiffCache{Vector{JNT}, Vector{JNT}}     = DiffCache(zeros(JNT, nu),  Ncache)
     g_cache::DiffCache{Vector{JNT}, Vector{JNT}}      = DiffCache(zeros(JNT, ng),  Ncache)
+    ge_cache::DiffCache{Vector{JNT}, Vector{JNT}}     = DiffCache(zeros(JNT, ne),  Ncache)
     gc_cache::DiffCache{Vector{JNT}, Vector{JNT}}     = DiffCache(zeros(JNT, nc),  Ncache)
     function Jfunc(ΔŨtup::T...) where T<:Real
         ΔŨ1 = ΔŨtup[begin]
@@ -523,11 +525,12 @@ function get_optim_functions(mpc::NonLinMPC, ::JuMP.GenericModel{JNT}) where JNT
         Ȳ,  Ū      = get_tmp(Ȳ_cache, ΔŨ1),  get_tmp(Ū_cache, ΔŨ1)
         x̂0, x̂0next = get_tmp(x̂0_cache, ΔŨ1), get_tmp(x̂0next_cache, ΔŨ1)
         u0, û0     = get_tmp(u0_cache, ΔŨ1), get_tmp(û0_cache, ΔŨ1)
-        gc         = get_tmp(gc_cache, ΔŨ1)
+        ge, gc     = get_tmp(ge_cache, ΔŨ1) ,get_tmp(gc_cache, ΔŨ1)
         Ŷ0, x̂0end  = predict!(Ȳ, x̂0, x̂0next, u0, û0, mpc, model, ΔŨ)
         Ue, Ŷe     = extended_predictions!(Ue, Ŷe, Ū, mpc, model, Ŷ0, ΔŨ)
         ϵ = (nϵ ≠ 0) ? ΔŨ[end] : zero(T) # ϵ = 0 if nϵ == 0 (meaning no relaxation)
         gc = con_custom!(gc, mpc, Ue, Ŷe, ϵ)
+        ge = con_equality!(ge, mpc, model)
         g  = con_nonlinprog!(g, mpc, model, x̂0end, Ŷ0, gc, ϵ)
         return obj_nonlinprog!(Ȳ, Ū, mpc, model, Ue, Ŷe, ΔŨ)::T
     end
@@ -542,11 +545,12 @@ function get_optim_functions(mpc::NonLinMPC, ::JuMP.GenericModel{JNT}) where JNT
             Ȳ,  Ū      = get_tmp(Ȳ_cache, ΔŨ1),  get_tmp(Ū_cache, ΔŨ1)
             x̂0, x̂0next = get_tmp(x̂0_cache, ΔŨ1), get_tmp(x̂0next_cache, ΔŨ1)
             u0, û0     = get_tmp(u0_cache, ΔŨ1), get_tmp(û0_cache, ΔŨ1)
-            gc         = get_tmp(gc_cache, ΔŨ1)
+            ge, gc     = get_tmp(ge_cache, ΔŨ1) ,get_tmp(gc_cache, ΔŨ1)
             Ŷ0, x̂0end  = predict!(Ȳ, x̂0, x̂0next, u0, û0, mpc, model, ΔŨ)
             Ue, Ŷe     = extended_predictions!(Ue, Ŷe, Ū, mpc, model, Ŷ0, ΔŨ)
             ϵ = (nϵ ≠ 0) ? ΔŨ[end] : zero(T) # ϵ = 0 if nϵ == 0 (meaning no relaxation)
             gc = con_custom!(gc, mpc, Ue, Ŷe, ϵ)
+            ge = con_equality!(ge, mpc, model, X̂0)
             g  = con_nonlinprog!(g, mpc, model, x̂0end, Ŷ0, gc, ϵ)
         end
         return g[i]::T
@@ -712,6 +716,14 @@ function con_custom!(gc, mpc::NonLinMPC, Ue, Ŷe, ϵ)
     mpc.con.nc ≠ 0 && mpc.con.gc!(gc, Ue, Ŷe, mpc.D̂e, mpc.p, ϵ)
     return gc
 end
+
+con_equality!(ge, mpc::NonLinMPC, model::LinModel) = ge
+
+function con_equality!(ge, mpc::NonLinMPC, model::NonLinModel)
+    return ge
+end
+
+
 
 "Evaluate the economic term `E*JE` of the objective function for [`NonLinMPC`](@ref)."
 function obj_econ(

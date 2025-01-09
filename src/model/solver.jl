@@ -1,6 +1,9 @@
 "Abstract supertype of all differential equation solvers."
 abstract type DiffSolver end
 
+abstract type ExplicitSolver <: DiffSolver end
+abstract type ImplicitSolver <: DiffSolver end
+
 "Empty solver for nonlinear discrete-time models."
 struct EmptySolver <: DiffSolver end
 get_solver_functions(::DataType, ::EmptySolver, f!, h!, _ ... ) = f!, h!
@@ -9,7 +12,7 @@ function Base.show(io::IO, solver::EmptySolver)
     print(io, "Empty differential equation solver.")
 end
 
-struct RungeKutta <: DiffSolver
+struct RungeKutta <: ExplicitSolver
     order::Int
     supersample::Int
     function RungeKutta(order::Int, supersample::Int)
