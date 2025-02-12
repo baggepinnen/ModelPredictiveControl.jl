@@ -1,4 +1,5 @@
 const DEFAULT_NONLINMPC_OPTIMIZER = optimizer_with_attributes(Ipopt.Optimizer,"sb"=>"yes")
+const DEFAULT_NONLINMPC_TRANSCRIPTION = :singleshooting
 
 struct NonLinMPC{
     NT<:Real, 
@@ -9,6 +10,7 @@ struct NonLinMPC{
     GCfunc<:Function
 } <: PredictiveController{NT}
     estim::SE
+    transcription::Symbol
     # note: `NT` and the number type `JNT` in `JuMP.GenericModel{JNT}` can be
     # different since solvers that support non-Float64 are scarce.
     optim::JM
@@ -47,7 +49,8 @@ struct NonLinMPC{
     buffer::PredictiveControllerBuffer{NT}
     function NonLinMPC{NT}(
         estim::SE, 
-        Hp, Hc, M_Hp, N_Hc, L_Hp, Cwt, Ewt, JE::JEfunc, gc!::GCfunc, nc, p::P, optim::JM
+        Hp, Hc, M_Hp, N_Hc, L_Hp, Cwt, Ewt, JE::JEfunc, gc!::GCfunc, nc, p::P, 
+        transcription, optim::JM
     ) where {
             NT<:Real, 
             SE<:StateEstimator, 
@@ -62,8 +65,10 @@ struct NonLinMPC{
         weights = ControllerWeights{NT}(model, Hp, Hc, M_Hp, N_Hc, L_Hp, Cwt, Ewt)
         # dummy vals (updated just before optimization):
         R̂y, R̂u, T_lastu = zeros(NT, ny*Hp), zeros(NT, nu*Hp), zeros(NT, nu*Hp)
-        S, T = init_ΔUtoU(model, Hp, Hc)
-        E, G, J, K, V, B, ex̂, gx̂, jx̂, kx̂, vx̂, bx̂ = init_predmat(estim, model, Hp, Hc)
+        S, T = init_ZtoU(estim, Hp, Hc, transcription)
+        E, G, J, K, V, B, ex̂, gx̂, jx̂, kx̂, vx̂, bx̂ = init_predmat(
+            estim, model, Hp, Hc, transcription
+        )
         # dummy vals (updated just before optimization):
         F, fx̂  = zeros(NT, ny*Hp), zeros(NT, nx̂)
         con, nϵ, S̃, Ẽ = init_defaultcon_mpc(
@@ -81,7 +86,7 @@ struct NonLinMPC{
         ΔŨ = zeros(NT, nΔŨ)
         buffer = PredictiveControllerBuffer{NT}(nu, ny, nd, Hp, Hc, nϵ)
         mpc = new{NT, SE, JM, P, JEfunc, GCfunc}(
-            estim, optim, con,
+            estim, transcription, optim, con,
             ΔŨ, ŷ,
             Hp, Hc, nϵ,
             weights,
@@ -109,7 +114,7 @@ Both [`NonLinModel`](@ref) and [`LinModel`](@ref) are supported (see Extended He
 controller minimizes the following objective function at each discrete time ``k``:
 ```math
 \begin{aligned}
-\min_{\mathbf{ΔU}, ϵ}\ & \mathbf{(R̂_y - Ŷ)}' \mathbf{M}_{H_p} \mathbf{(R̂_y - Ŷ)}   
+\min_{\mathbf{Z}, ϵ}\ & \mathbf{(R̂_y - Ŷ)}' \mathbf{M}_{H_p} \mathbf{(R̂_y - Ŷ)}   
                        + \mathbf{(ΔU)}'      \mathbf{N}_{H_c} \mathbf{(ΔU)}        \\&
                        + \mathbf{(R̂_u - U)}' \mathbf{L}_{H_p} \mathbf{(R̂_u - U)} 
                        + C ϵ^2  
@@ -120,6 +125,11 @@ subject to [`setconstraint!`](@ref) bounds, and the custom inequality constraint
 ```math
 \mathbf{g_c}(\mathbf{U_e}, \mathbf{Ŷ_e}, \mathbf{D̂_e}, \mathbf{p}, ϵ) ≤ \mathbf{0}
 ```
+and the slack ``ϵ`` and the ``\mathbf{Z}`` vector as the decision variables:
+
+- ``\mathbf{Z} = \mathbf{ΔU}`` if the transcription method is `:singleshooting`
+- ``\mathbf{Z} = [\begin{smallmatrix} \mathbf{ΔU}' & \mathbf{X̂}' \end{smallmatrix}]'`` if the transcription method is `:multipleshoting`
+
 The economic function ``J_E`` can penalizes solutions with high economic costs. Setting all
 the weights to 0 except ``E``  creates a pure economic model predictive controller (EMPC). 
 As a matter of fact, ``J_E`` can be any nonlinear function to customize the objective, even
@@ -169,6 +179,8 @@ This controller allocates memory at each time step for the optimization.
    not (details in Extended Help).
 - `nc=0` : number of custom inequality constraints.
 - `p=model.p` : ``J_E`` and ``\mathbf{g_c}`` functions parameter ``\mathbf{p}`` (any type).
+- `transcription=:singleshooting` : transcription method for the nonlinear optimization 
+    problem, can be `:singleshooting` or `:multipleshoting`.
 - `optim=JuMP.Model(Ipopt.Optimizer)` : nonlinear optimizer used in the predictive
    controller, provided as a [`JuMP.Model`](https://jump.dev/JuMP.jl/stable/api/JuMP/#JuMP.Model)
    (default to [`Ipopt`](https://github.com/jump-dev/Ipopt.jl) optimizer).
@@ -246,13 +258,15 @@ function NonLinMPC(
     gc ::Function = gc!,
     nc::Int = 0,
     p = model.p,
+    transcription = DEFAULT_NONLINMPC_TRANSCRIPTION,
     optim::JuMP.GenericModel = JuMP.Model(DEFAULT_NONLINMPC_OPTIMIZER, add_bridges=false),
     kwargs...
 )
     estim = UnscentedKalmanFilter(model; kwargs...)
     return NonLinMPC(
         estim; 
-        Hp, Hc, Mwt, Nwt, Lwt, Cwt, Ewt, JE, gc, nc, p, M_Hp, N_Hc, L_Hp, optim
+        Hp, Hc, Mwt, Nwt, Lwt, Cwt, Ewt, JE, gc, nc, p, M_Hp, N_Hc, L_Hp, 
+        transcription, optim
     )
 end
 
@@ -273,13 +287,15 @@ function NonLinMPC(
     gc ::Function = gc!,
     nc::Int = 0,
     p = model.p,
+    transcription = DEFAULT_NONLINMPC_TRANSCRIPTION,
     optim::JuMP.GenericModel = JuMP.Model(DEFAULT_NONLINMPC_OPTIMIZER, add_bridges=false),
     kwargs...
 )
     estim = SteadyKalmanFilter(model; kwargs...)
     return NonLinMPC(
         estim; 
-        Hp, Hc, Mwt, Nwt, Lwt, Cwt, Ewt, JE, gc, nc, p, M_Hp, N_Hc, L_Hp, optim
+        Hp, Hc, Mwt, Nwt, Lwt, Cwt, Ewt, JE, gc, nc, p, M_Hp, N_Hc, L_Hp, 
+        transcription, optim
     )
 end
 
@@ -324,6 +340,7 @@ function NonLinMPC(
     gc ::Function = gc!,
     nc = 0,
     p::P = estim.model.p,
+    transcription = DEFAULT_NONLINMPC_TRANSCRIPTION,
     optim::JM = JuMP.Model(DEFAULT_NONLINMPC_OPTIMIZER, add_bridges=false),
 ) where {
     NT<:Real, 
@@ -339,7 +356,8 @@ function NonLinMPC(
     validate_JE(NT, JE)
     gc! = get_mutating_gc(NT, gc)
     return NonLinMPC{NT}(
-        estim, Hp, Hc, M_Hp, N_Hc, L_Hp, Cwt, Ewt, JE, gc!, nc, p, optim
+        estim, Hp, Hc, M_Hp, N_Hc, L_Hp, Cwt, Ewt, JE, gc!, nc, p, 
+        transcription, optim
     )
 end
 
