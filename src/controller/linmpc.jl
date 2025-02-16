@@ -1,13 +1,16 @@
 const DEFAULT_LINMPC_OPTIMIZER = OSQP.MathOptInterfaceOSQP.Optimizer
+const DEFAULT_LINMPC_TRANSCRIPTION = SingleShooting()
 
 struct LinMPC{
     NT<:Real, 
     SE<:StateEstimator, 
+    TM<:TranscriptionMethod,
     JM<:JuMP.GenericModel
 } <: PredictiveController{NT}
     estim::SE
     # note: `NT` and the number type `JNT` in `JuMP.GenericModel{JNT}` can be
     # different since solvers that support non-Float64 are scarce.
+    transcription::TM
     optim::JM
     con::ControllerConstraint{NT, Nothing}
     ΔŨ::Vector{NT}
@@ -41,16 +44,19 @@ struct LinMPC{
     Dop::Vector{NT}
     buffer::PredictiveControllerBuffer{NT}
     function LinMPC{NT}(
-        estim::SE, Hp, Hc, M_Hp, N_Hc, L_Hp, Cwt, optim::JM
-    ) where {NT<:Real, SE<:StateEstimator, JM<:JuMP.GenericModel}
+        estim::SE, Hp, Hc, M_Hp, N_Hc, L_Hp, Cwt, 
+        transcription::TM, optim::JM
+    ) where {NT<:Real, SE<:StateEstimator, TM<:TranscriptionMethod, JM<:JuMP.GenericModel}
         model = estim.model
         nu, ny, nd, nx̂ = model.nu, model.ny, model.nd, estim.nx̂
         ŷ = copy(model.yop) # dummy vals (updated just before optimization)
         weights = ControllerWeights{NT}(model, Hp, Hc, M_Hp, N_Hc, L_Hp, Cwt)
         # dummy vals (updated just before optimization):
         R̂y, R̂u, T_lastu = zeros(NT, ny*Hp), zeros(NT, nu*Hp), zeros(NT, nu*Hp)
-        S, T = init_ΔUtoU(model, Hp, Hc)
-        E, G, J, K, V, B, ex̂, gx̂, jx̂, kx̂, vx̂, bx̂ = init_predmat(estim, model, Hp, Hc)
+        S, T = init_ZtoU(estim, transcription, Hp, Hc)
+        E, G, J, K, V, B, ex̂, gx̂, jx̂, kx̂, vx̂, bx̂ = init_predmat(
+            model, estim, transcription, Hp, Hc
+        )
         # dummy vals (updated just before optimization):
         F, fx̂  = zeros(NT, ny*Hp), zeros(NT, nx̂)
         con, nϵ, S̃, Ẽ = init_defaultcon_mpc(
@@ -66,8 +72,8 @@ struct LinMPC{
         nΔŨ = size(Ẽ, 2)
         ΔŨ = zeros(NT, nΔŨ)
         buffer = PredictiveControllerBuffer{NT}(nu, ny, nd, Hp, Hc, nϵ)
-        mpc = new{NT, SE, JM}(
-            estim, optim, con,
+        mpc = new{NT, SE, TM, JM}(
+            estim, transcription, optim, con,
             ΔŨ, ŷ,
             Hp, Hc, nϵ,
             weights,
@@ -93,7 +99,7 @@ Construct a linear predictive controller based on [`LinModel`](@ref) `model`.
 The controller minimizes the following objective function at each discrete time ``k``:
 ```math
 \begin{aligned}
-\min_{\mathbf{ΔU}, ϵ}   \mathbf{(R̂_y - Ŷ)}' \mathbf{M}_{H_p} \mathbf{(R̂_y - Ŷ)}
+\min_{\mathbf{Z}, ϵ}   \mathbf{(R̂_y - Ŷ)}' \mathbf{M}_{H_p} \mathbf{(R̂_y - Ŷ)}
                       + \mathbf{(ΔU)}'      \mathbf{N}_{H_c} \mathbf{(ΔU)}        \\
                       + \mathbf{(R̂_u - U)}' \mathbf{L}_{H_p} \mathbf{(R̂_u - U)} 
                       + C ϵ^2
@@ -109,8 +115,10 @@ subject to [`setconstraint!`](@ref) bounds, and in which the weight matrices are
 \end{aligned}
 ```
 Time-varying and non-diagonal weights are also supported. Modify the last block in 
-``\mathbf{M}_{H_p}`` to specify a terminal weight. The ``\mathbf{ΔU}`` includes the input 
-increments ``\mathbf{Δu}(k+j) = \mathbf{u}(k+j) - \mathbf{u}(k+j-1)`` from ``j=0`` to
+``\mathbf{M}_{H_p}`` to specify a terminal weight. The content of the decision variable
+vector ``\mathbf{Z}`` depends on the chosen [`TranscriptionMethod`](@ref) (default to
+[`SingleShooting`](@ref)). The ``\mathbf{ΔU}`` includes the input increments 
+``\mathbf{Δu}(k+j) = \mathbf{u}(k+j) - \mathbf{u}(k+j-1)`` from ``j=0`` to
 ``H_c-1``, the ``\mathbf{Ŷ}`` vector, the output predictions ``\mathbf{ŷ}(k+j)`` from
 ``j=1`` to ``H_p``, and the ``\mathbf{U}`` vector, the manipulated inputs ``\mathbf{u}(k+j)``
 from ``j=0`` to ``H_p-1``. The slack variable ``ϵ`` relaxes the constraints, as described
@@ -130,10 +138,10 @@ arguments. This controller allocates memory at each time step for the optimizati
 - `N_Hc=diagm(repeat(Nwt,Hc))` : positive semidefinite symmetric matrix ``\mathbf{N}_{H_c}``.
 - `L_Hp=diagm(repeat(Lwt,Hp))` : positive semidefinite symmetric matrix ``\mathbf{L}_{H_p}``.
 - `Cwt=1e5` : slack variable weight ``C`` (scalar), use `Cwt=Inf` for hard constraints only.
+- `transcription=SingleShooting()` : a [`TranscriptionMethod`](@ref) for the optimization.
 - `optim=JuMP.Model(OSQP.MathOptInterfaceOSQP.Optimizer)` : quadratic optimizer used in
   the predictive controller, provided as a [`JuMP.Model`](https://jump.dev/JuMP.jl/stable/api/JuMP/#JuMP.Model)
   (default to [`OSQP`](https://osqp.org/docs/parsers/jump.html) optimizer).
-
 - additional keyword arguments are passed to [`SteadyKalmanFilter`](@ref) constructor.
 
 # Examples
@@ -164,9 +172,11 @@ LinMPC controller with a sample time Ts = 4.0 s, OSQP optimizer, SteadyKalmanFil
     | :------------------- | :------------------------------------------------------- | :--------------- |
     | ``H_p``              | prediction horizon (integer)                             | `()`             |
     | ``H_c``              | control horizon (integer)                                | `()`             |
+    | ``\mathbf{Z}``       | decision variable vector (excluding ``ϵ``)               |  var.            |
     | ``\mathbf{ΔU}``      | manipulated input increments over ``H_c``                | `(nu*Hc,)`       |
     | ``\mathbf{D̂}``       | predicted measured disturbances over ``H_p``             | `(nd*Hp,)`       |
     | ``\mathbf{Ŷ}``       | predicted outputs over ``H_p``                           | `(ny*Hp,)`       |
+    | ``\mathbf{X̂}``       | predicted states over ``H_p``                            | `(nx̂*Hp,)`       |
     | ``\mathbf{U}``       | manipulated inputs over ``H_p``                          | `(nu*Hp,)`       |
     | ``\mathbf{R̂_y}``     | predicted output setpoints over ``H_p``                  | `(ny*Hp,)`       |
     | ``\mathbf{R̂_u}``     | predicted manipulated input setpoints over ``H_p``       | `(nu*Hp,)`       |
@@ -187,11 +197,12 @@ function LinMPC(
     N_Hc = diagm(repeat(Nwt, Hc)),
     L_Hp = diagm(repeat(Lwt, Hp)),
     Cwt = DEFAULT_CWT,
+    transcription::TranscriptionMethod = DEFAULT_LINMPC_TRANSCRIPTION,
     optim::JuMP.GenericModel = JuMP.Model(DEFAULT_LINMPC_OPTIMIZER, add_bridges=false),
     kwargs...
 )
     estim = SteadyKalmanFilter(model; kwargs...)
-    return LinMPC(estim; Hp, Hc, Mwt, Nwt, Lwt, Cwt, M_Hp, N_Hc, L_Hp, optim)
+    return LinMPC(estim; Hp, Hc, Mwt, Nwt, Lwt, Cwt, M_Hp, N_Hc, L_Hp, transcription, optim)
 end
 
 
@@ -229,6 +240,7 @@ function LinMPC(
     N_Hc = diagm(repeat(Nwt, Hc)),
     L_Hp = diagm(repeat(Lwt, Hp)),
     Cwt  = DEFAULT_CWT,
+    transcription::TranscriptionMethod = DEFAULT_LINMPC_TRANSCRIPTION,
     optim::JM = JuMP.Model(DEFAULT_LINMPC_OPTIMIZER, add_bridges=false),
 ) where {NT<:Real, SE<:StateEstimator{NT}, JM<:JuMP.GenericModel}
     isa(estim.model, LinModel) || error("estim.model type must be a LinModel") 
@@ -237,7 +249,7 @@ function LinMPC(
         @warn("prediction horizon Hp ($Hp) ≤ estimated number of delays in model "*
               "($nk), the closed-loop system may be unstable or zero-gain (unresponsive)")
     end
-    return LinMPC{NT}(estim, Hp, Hc, M_Hp, N_Hc, L_Hp, Cwt, optim)
+    return LinMPC{NT}(estim, Hp, Hc, M_Hp, N_Hc, L_Hp, Cwt, transcription, optim)
 end
 
 """

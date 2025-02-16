@@ -36,6 +36,7 @@ end
 
 "Include all the data for the constraints of [`PredictiveController`](@ref)"
 struct ControllerConstraint{NT<:Real, GCfunc<:Union{Nothing, Function}}
+    # matrices for the terminal constraints:
     ẽx̂      ::Matrix{NT}
     fx̂      ::Vector{NT}
     gx̂      ::Matrix{NT}
@@ -43,6 +44,15 @@ struct ControllerConstraint{NT<:Real, GCfunc<:Union{Nothing, Function}}
     kx̂      ::Matrix{NT}
     vx̂      ::Matrix{NT}
     bx̂      ::Vector{NT}
+    # matrices for the zero defect constraints (N/A for single shooting transcriptions):
+    Ẽŝ      ::Matrix{NT}
+    Fŝ      ::Vector{NT}
+    Gŝ      ::Matrix{NT}
+    Jŝ      ::Matrix{NT}
+    Kŝ      ::Matrix{NT}
+    Vŝ      ::Matrix{NT}
+    Bŝ      ::Vector{NT}
+    # bounds over the prediction horizon (deviation vectors from operating points):
     U0min   ::Vector{NT}
     U0max   ::Vector{NT}
     ΔŨmin   ::Vector{NT}
@@ -51,6 +61,7 @@ struct ControllerConstraint{NT<:Real, GCfunc<:Union{Nothing, Function}}
     Y0max   ::Vector{NT}
     x̂0min   ::Vector{NT}
     x̂0max   ::Vector{NT}
+    # A matrices for the linear inequality constraints:
     A_Umin  ::Matrix{NT}
     A_Umax  ::Matrix{NT}
     A_ΔŨmin ::Matrix{NT}
@@ -60,13 +71,18 @@ struct ControllerConstraint{NT<:Real, GCfunc<:Union{Nothing, Function}}
     A_x̂min  ::Matrix{NT}
     A_x̂max  ::Matrix{NT}
     A       ::Matrix{NT}
+    # b vector for the linear inequality constraints:
     b       ::Vector{NT}
+    # indices of finite numbers in the b vector (linear inequality constraints):
     i_b     ::BitVector
+    # constraint softness parameter vectors for the nonlinear inequality constraints:
     C_ymin  ::Vector{NT}
     C_ymax  ::Vector{NT}
     c_x̂min  ::Vector{NT}
     c_x̂max  ::Vector{NT}
+    # indices of finite numbers in the g vector (nonlinear inequality constraints):
     i_g     ::BitVector
+    # custom nonlinear inequality constraints:
     gc!     ::GCfunc
     nc      ::Int
 end
@@ -445,231 +461,6 @@ function validate_args(mpc::PredictiveController, ry, d, D̂, R̂y, R̂u)
     size(R̂u) ≠ (nu*Hp,) && throw(DimensionMismatch("R̂u size $(size(R̂u)) ≠ manip. input size × Hp ($(nu*Hp),)"))
 end
 
-
-@doc raw"""
-    init_ΔUtoU(model, Hp, Hc) -> S, T
-
-Init manipulated input increments to inputs conversion matrices.
-
-The conversion from the input increments ``\mathbf{ΔU}`` to manipulated inputs over ``H_p`` 
-are calculated by:
-```math
-\mathbf{U} = \mathbf{S} \mathbf{ΔU} + \mathbf{T} \mathbf{u}(k-1)
-```
-The ``\mathbf{S}`` and ``\mathbf{T}`` matrices are defined in the Extended Help section.
-
-# Extended Help
-!!! details "Extended Help"
-    The ``\mathbf{U}`` vector and the two conversion matrices are defined as:
-    ```math
-    \mathbf{U} = \begin{bmatrix}
-        \mathbf{u}(k + 0)                                           \\
-        \mathbf{u}(k + 1)                                           \\
-        \vdots                                                      \\
-        \mathbf{u}(k + H_c - 1)                                     \\
-        \vdots                                                      \\
-        \mathbf{u}(k + H_p - 1)                                     \end{bmatrix} , \quad
-    \mathbf{S} = \begin{bmatrix}
-        \mathbf{I}  & \mathbf{0}    & \cdots    & \mathbf{0}        \\
-        \mathbf{I}  & \mathbf{I}    & \cdots    & \mathbf{0}        \\
-        \vdots      & \vdots        & \ddots    & \vdots            \\
-        \mathbf{I}  & \mathbf{I}    & \cdots    & \mathbf{I}        \\
-        \vdots      & \vdots        & \ddots    & \vdots            \\
-        \mathbf{I}  & \mathbf{I}    & \cdots    & \mathbf{I}        \end{bmatrix} , \quad
-    \mathbf{T} = \begin{bmatrix}
-        \mathbf{I}                                                  \\
-        \mathbf{I}                                                  \\
-        \vdots                                                      \\
-        \mathbf{I}                                                  \\
-        \vdots                                                      \\
-        \mathbf{I}                                                  \end{bmatrix}
-    ```
-"""
-function init_ΔUtoU(model::SimModel{NT}, Hp, Hc) where {NT<:Real}
-    # S and T are `Matrix{NT}` since conversion is faster than `Matrix{Bool}` or `BitMatrix`
-    I_nu = Matrix{NT}(I, model.nu, model.nu)
-    S_Hc = LowerTriangular(repeat(I_nu, Hc, Hc))
-    S = [S_Hc; repeat(I_nu, Hp - Hc, Hc)]
-    T = repeat(I_nu, Hp)
-    return S, T
-end
-
-
-@doc raw"""
-    init_predmat(estim, model::LinModel, Hp, Hc) -> E, G, J, K, V, ex̂, gx̂, jx̂, kx̂, vx̂
-
-Construct the prediction matrices for [`LinModel`](@ref) `model`.
-
-The model predictions are evaluated from the deviation vectors (see [`setop!`](@ref)) and:
-```math
-\begin{aligned}
-    \mathbf{Ŷ_0} &= \mathbf{E ΔU} + \mathbf{G d_0}(k) + \mathbf{J D̂_0} 
-                                  + \mathbf{K x̂_0}(k) + \mathbf{V u_0}(k-1) 
-                                  + \mathbf{B}        + \mathbf{Ŷ_s}                      \\
-                 &= \mathbf{E ΔU} + \mathbf{F}
-\end{aligned}
-```
-in which ``\mathbf{x̂_0}(k) = \mathbf{x̂}_i(k) - \mathbf{x̂_{op}}``, with ``i = k`` if 
-`estim.direct==true`, otherwise ``i = k - 1``. The predicted outputs ``\mathbf{Ŷ_0}`` and
-measured disturbances ``\mathbf{D̂_0}`` respectively include ``\mathbf{ŷ_0}(k+j)`` and 
-``\mathbf{d̂_0}(k+j)`` values with ``j=1`` to ``H_p``, and input increments ``\mathbf{ΔU}``,
-``\mathbf{Δu}(k+j)`` from ``j=0`` to ``H_c-1``. The vector ``\mathbf{B}`` contains the
-contribution for non-zero state ``\mathbf{x̂_{op}}`` and state update ``\mathbf{f̂_{op}}``
-operating points (for linearization at non-equilibrium point, see [`linearize`](@ref)). The
-stochastic predictions ``\mathbf{Ŷ_s=0}`` if `estim` is not a [`InternalModel`](@ref), see
-[`init_stochpred`](@ref). The method also computes similar matrices for the predicted
-terminal states at ``k+H_p``:
-```math
-\begin{aligned}
-    \mathbf{x̂_0}(k+H_p) &= \mathbf{e_x̂ ΔU} + \mathbf{g_x̂ d_0}(k)   + \mathbf{j_x̂ D̂_0} 
-                                           + \mathbf{k_x̂ x̂_0}(k) + \mathbf{v_x̂ u_0}(k-1)
-                                           + \mathbf{b_x̂}                                 \\
-                        &= \mathbf{e_x̂ ΔU} + \mathbf{f_x̂}
-\end{aligned}
-```
-The matrices ``\mathbf{E, G, J, K, V, B, e_x̂, g_x̂, j_x̂, k_x̂, v_x̂, b_x̂}`` are defined in the
-Extended Help section. The ``\mathbf{F}`` and ``\mathbf{f_x̂}`` vectors are  recalculated at
-each control period ``k``, see [`initpred!`](@ref) and [`linconstraint!`](@ref).
-
-# Extended Help
-!!! details "Extended Help"
-    Using the augmented matrices ``\mathbf{Â, B̂_u, Ĉ, B̂_d, D̂_d}`` in `estim` (see 
-    [`augment_model`](@ref)), and the function ``\mathbf{W}(j) = ∑_{i=0}^j \mathbf{Â}^i``,
-    the prediction matrices are computed by :
-    ```math
-    \begin{aligned}
-    \mathbf{E} &= \begin{bmatrix}
-        \mathbf{Ĉ W}(0)\mathbf{B̂_u}     & \mathbf{0}                      & \cdots & \mathbf{0}                                        \\
-        \mathbf{Ĉ W}(1)\mathbf{B̂_u}     & \mathbf{Ĉ W}(0)\mathbf{B̂_u}     & \cdots & \mathbf{0}                                        \\
-        \vdots                          & \vdots                          & \ddots & \vdots                                            \\
-        \mathbf{Ĉ W}(H_p-1)\mathbf{B̂_u} & \mathbf{Ĉ W}(H_p-2)\mathbf{B̂_u} & \cdots & \mathbf{Ĉ W}(H_p-H_c+1)\mathbf{B̂_u} \end{bmatrix} \\
-    \mathbf{G} &= \begin{bmatrix}
-        \mathbf{Ĉ}\mathbf{Â}^{0} \mathbf{B̂_d}     \\ 
-        \mathbf{Ĉ}\mathbf{Â}^{1} \mathbf{B̂_d}     \\ 
-        \vdots                                    \\
-        \mathbf{Ĉ}\mathbf{Â}^{H_p-1} \mathbf{B̂_d} \end{bmatrix} \\
-    \mathbf{J} &= \begin{bmatrix}
-        \mathbf{D̂_d}                              & \mathbf{0}                                & \cdots & \mathbf{0}   \\ 
-        \mathbf{Ĉ}\mathbf{Â}^{0} \mathbf{B̂_d}     & \mathbf{D̂_d}                              & \cdots & \mathbf{0}   \\ 
-        \vdots                                    & \vdots                                    & \ddots & \vdots       \\
-        \mathbf{Ĉ}\mathbf{Â}^{H_p-2} \mathbf{B̂_d} & \mathbf{Ĉ}\mathbf{Â}^{H_p-3} \mathbf{B̂_d} & \cdots & \mathbf{D̂_d} \end{bmatrix} \\
-    \mathbf{K} &= \begin{bmatrix}
-        \mathbf{Ĉ}\mathbf{Â}^{1}        \\
-        \mathbf{Ĉ}\mathbf{Â}^{2}        \\
-        \vdots                          \\
-        \mathbf{Ĉ}\mathbf{Â}^{H_p}      \end{bmatrix} \\
-    \mathbf{V} &= \begin{bmatrix}
-        \mathbf{Ĉ W}(0)\mathbf{B̂_u}     \\
-        \mathbf{Ĉ W}(1)\mathbf{B̂_u}     \\
-        \vdots                          \\
-        \mathbf{Ĉ W}(H_p-1)\mathbf{B̂_u} \end{bmatrix} \\
-    \mathbf{B} &= \begin{bmatrix}
-        \mathbf{Ĉ W}(0)                 \\
-        \mathbf{Ĉ W}(1)                 \\
-        \vdots                          \\
-        \mathbf{Ĉ W}(H_p-1)             \end{bmatrix}   \mathbf{\big(f̂_{op} - x̂_{op}\big)} 
-    \end{aligned}
-    ```
-    For the terminal constraints, the matrices are computed with:
-    ```math
-    \begin{aligned}
-    \mathbf{e_x̂} &= \begin{bmatrix} 
-                        \mathbf{W}(H_p-1)\mathbf{B̂_u} & 
-                        \mathbf{W}(H_p-2)\mathbf{B̂_u} & 
-                        \cdots & 
-                        \mathbf{W}(H_p-H_c+1)\mathbf{B̂_u} \end{bmatrix} \\
-    \mathbf{g_x̂} &= \mathbf{Â}^{H_p-1} \mathbf{B̂_d} \\
-    \mathbf{j_x̂} &= \begin{bmatrix} 
-                        \mathbf{Â}^{H_p-2} \mathbf{B̂_d} & 
-                        \mathbf{Â}^{H_p-3} \mathbf{B̂_d} & 
-                        \cdots & 
-                        \mathbf{0} 
-                    \end{bmatrix} \\
-    \mathbf{k_x̂} &= \mathbf{Â}^{H_p} \\
-    \mathbf{v_x̂} &= \mathbf{W}(H_p-1)\mathbf{B̂_u} \\
-    \mathbf{b_x̂} &= \mathbf{W}(H_p-1)    \mathbf{\big(f̂_{op} - x̂_{op}\big)}
-    \end{aligned}
-    ```
-"""
-function init_predmat(estim::StateEstimator{NT}, model::LinModel, Hp, Hc) where {NT<:Real}
-    Â, B̂u, Ĉ, B̂d, D̂d = estim.Â, estim.B̂u, estim.Ĉ, estim.B̂d, estim.D̂d
-    nu, nx̂, ny, nd = model.nu, estim.nx̂, model.ny, model.nd
-    # --- pre-compute matrix powers ---
-    # Apow 3D array : Apow[:,:,1] = A^0, Apow[:,:,2] = A^1, ... , Apow[:,:,Hp+1] = A^Hp
-    Âpow = Array{NT}(undef, nx̂, nx̂, Hp+1)
-    Âpow[:,:,1] = I(nx̂)
-    for j=2:Hp+1
-        Âpow[:,:,j] = @views Âpow[:,:,j-1]*Â
-    end
-    # Apow_csum 3D array : Apow_csum[:,:,1] = A^0, Apow_csum[:,:,2] = A^1 + A^0, ...
-    Âpow_csum  = cumsum(Âpow, dims=3)
-    # helper function to improve code clarity and be similar to eqs. in docstring:
-    getpower(array3D, power) = @views array3D[:,:, power+1]
-    # --- state estimates x̂ ---
-    kx̂ = getpower(Âpow, Hp)
-    K  = Matrix{NT}(undef, Hp*ny, nx̂)
-    for j=1:Hp
-        iRow = (1:ny) .+ ny*(j-1)
-        K[iRow,:] = Ĉ*getpower(Âpow, j)
-    end    
-    # --- manipulated inputs u ---
-    vx̂ = getpower(Âpow_csum, Hp-1)*B̂u
-    V  = Matrix{NT}(undef, Hp*ny, nu)
-    for j=1:Hp
-        iRow = (1:ny) .+ ny*(j-1)
-        V[iRow,:] = Ĉ*getpower(Âpow_csum, j-1)*B̂u
-    end
-    ex̂ = Matrix{NT}(undef, nx̂, Hc*nu)
-    E  = zeros(NT, Hp*ny, Hc*nu) 
-    for j=1:Hc # truncated with control horizon
-        iRow = (ny*(j-1)+1):(ny*Hp)
-        iCol = (1:nu) .+ nu*(j-1)
-        E[iRow, iCol] = V[iRow .- ny*(j-1),:]
-        ex̂[:  , iCol] = getpower(Âpow_csum, Hp-j)*B̂u
-    end
-    # --- measured disturbances d ---
-    gx̂ = getpower(Âpow, Hp-1)*B̂d
-    G  = Matrix{NT}(undef, Hp*ny, nd)
-    jx̂ = Matrix{NT}(undef, nx̂, Hp*nd)
-    J  = repeatdiag(D̂d, Hp)
-    if nd ≠ 0
-        for j=1:Hp
-            iRow = (1:ny) .+ ny*(j-1)
-            G[iRow,:] = Ĉ*getpower(Âpow, j-1)*B̂d
-        end
-        for j=1:Hp
-            iRow = (ny*j+1):(ny*Hp)
-            iCol = (1:nd) .+ nd*(j-1)
-            J[iRow, iCol] = G[iRow .- ny*j,:]
-            jx̂[:  , iCol] = j < Hp ? getpower(Âpow, Hp-j-1)*B̂d : zeros(NT, nx̂, nd)
-        end
-    end
-    # --- state x̂op and state update f̂op operating points ---
-    coef_bx̂ = getpower(Âpow_csum, Hp-1)
-    coef_B  = Matrix{NT}(undef, ny*Hp, nx̂)
-    for j=1:Hp
-        iRow = (1:ny) .+ ny*(j-1)
-        coef_B[iRow,:] = Ĉ*getpower(Âpow_csum, j-1)
-    end
-    f̂op_n_x̂op = estim.f̂op - estim.x̂op
-    bx̂ = coef_bx̂ * f̂op_n_x̂op
-    B  = coef_B  * f̂op_n_x̂op
-    return E, G, J, K, V, B, ex̂, gx̂, jx̂, kx̂, vx̂, bx̂
-end
-
-"Return empty matrices if `model` is not a [`LinModel`](@ref)"
-function init_predmat(estim::StateEstimator{NT}, model::SimModel, Hp, Hc) where {NT<:Real}
-    nu, nx̂, nd = model.nu, estim.nx̂, model.nd
-    E  = zeros(NT, 0, nu*Hc)
-    G  = zeros(NT, 0, nd)
-    J  = zeros(NT, 0, nd*Hp)
-    K  = zeros(NT, 0, nx̂)
-    V  = zeros(NT, 0, nu)
-    B  = zeros(NT, 0)
-    ex̂, gx̂, jx̂, kx̂, vx̂, bx̂ = E, G, J, K, V, B
-    return E, G, J, K, V, B, ex̂, gx̂, jx̂, kx̂, vx̂, bx̂
-end
-
 @doc raw"""
     init_quadprog(model::LinModel, weights::ControllerWeights, Ẽ, S) -> H̃
 
@@ -773,7 +564,7 @@ Augment manipulated inputs constraints with slack variable ϵ for softening.
 Denoting the input increments augmented with the slack variable
 ``\mathbf{ΔŨ} = [\begin{smallmatrix} \mathbf{ΔU} \\ ϵ \end{smallmatrix}]``, it returns the
 augmented conversion matrix ``\mathbf{S̃}``, similar to the one described at
-[`init_ΔUtoU`](@ref). It also returns the ``\mathbf{A}`` matrices for the inequality
+[`init_ZtoU`](@ref). It also returns the ``\mathbf{A}`` matrices for the inequality
 constraints:
 ```math
 \begin{bmatrix} 
